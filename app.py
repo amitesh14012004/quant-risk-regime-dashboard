@@ -179,9 +179,32 @@ def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
     """All heavy computation cached."""
 
     # 1. Data
-    df     = yf.download(ticker_sym, start=str(start), end=str(end), progress=False)
-    prices = df["Close"].squeeze()
-    returns = (np.log(prices / prices.shift(1)) * 100).dropna()
+    df = yf.download(
+        ticker_sym,
+        start=str(start),
+        end=str(end),
+        auto_adjust=True,
+        progress=False,
+        threads=False
+    )
+
+    if df.empty:
+        raise ValueError(f"No data downloaded for {ticker_sym}. Check ticker or date range.")
+
+    if isinstance(df.columns, pd.MultiIndex):
+        prices = df["Close"].iloc[:,0]
+    else:
+        prices = df["Close"]
+
+    prices = prices.dropna()
+    if len(prices) < 50:
+        raise ValueError("Too few price observations.")
+
+    returns = np.log(prices / prices.shift(1))
+    returns = returns.replace([np.inf,-np.inf], np.nan).dropna()*100
+
+    if len(returns) < 100:
+        raise ValueError(f"Only {len(returns)} return observations available.")
 
     # 2. GARCH(1,1)
     garch_mdl = arch_model(returns, vol="Garch", p=1, q=1,
@@ -269,8 +292,10 @@ if run_button:
             df, params, garch_res, hmm, labels_map, color_map, comparison, returns = \
                 load_and_compute(TICKERS[ticker_name], start_date, end_date,
                                  confidence, n_regimes)
-        except Exception as e:
-            st.error(f"❌ Error: {e}")
+        except Exception:
+            import traceback
+            st.error("Analysis failed.")
+            st.code(traceback.format_exc())
             st.stop()
 
     # Scale VaR/CVaR to actual portfolio value
@@ -684,7 +709,10 @@ if run_button:
         f_vol_annual = f_vol_daily * np.sqrt(252)
 
         current_vol = df["annual_vol"].iloc[-1]
-        long_run_vol = np.sqrt(params["omega"] / (1 - params["persistence"])) * np.sqrt(252)
+        if params["persistence"] < 0.999:
+            long_run_vol = np.sqrt(params["omega"]/(1-params["persistence"])) * np.sqrt(252)
+        else:
+            long_run_vol = np.nan
 
         # Forecast table
         forecast_df = pd.DataFrame({
