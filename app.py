@@ -1,14 +1,13 @@
 """
 Multi-Asset Volatility Regime Detection & Risk Dashboard
 =========================================================
-FIXED VERSION — Resolves:
-  1. yfinance MultiIndex column extraction (modern yfinance returns MultiIndex always)
-  2. arch 6+ forecast() API — uses start=len(returns)-1 to get last-row forecast
-  3. Empty-array GARCH forecast error
-  4. Robust price extraction with fallback chain
+FIXED VERSION v2 — Resolves:
+  1. yfinance ^NSEI / ^NSEBANK / ^CNXIT ticker failures (symbol aliasing + retry chain)
+  2. MultiIndex column extraction (modern yfinance)
+  3. arch 6+ forecast() API
+  4. Pinned yfinance==0.2.40 via requirements.txt
 
 Run with: streamlit run app.py
-Install:  pip install streamlit arch hmmlearn yfinance plotly scikit-learn scipy
 """
 
 import streamlit as st
@@ -54,10 +53,14 @@ st.divider()
 # ─────────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Configuration")
 
+# Each entry: display name → list of ticker symbols to try in order
 TICKERS = {
-    "Nifty 50":   "^NSEI",
-    "Nifty Bank": "^NSEBANK",
-    "Nifty IT":   "^CNXIT",
+    "Nifty 50":   ["^NSEI", "NIFTYBEES.NS", "0P0000YWQO.BO"],
+    "Nifty Bank": ["^NSEBANK", "BANKBEES.NS", "BNKBEES.NS"],
+    "Nifty IT":   ["^CNXIT", "ITBEES.NS"],
+    "BSE Sensex": ["^BSESN"],
+    "S&P 500":    ["^GSPC"],
+    "Nasdaq 100": ["^NDX"],
 }
 
 ticker_name   = st.sidebar.selectbox("Primary Index", list(TICKERS.keys()))
@@ -81,27 +84,82 @@ run_button = st.sidebar.button("🚀 Run Analysis", type="primary", use_containe
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────
 
+def download_with_fallback(ticker_list: list, start: str, end: str) -> tuple[pd.Series, str]:
+    """
+    Try each ticker symbol in ticker_list until one returns data.
+    Returns (price_series, symbol_used).
+    """
+    errors = []
+    for sym in ticker_list:
+        try:
+            raw = yf.download(
+                sym,
+                start=start,
+                end=end,
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            prices = extract_close(raw, sym)
+            prices = prices[prices > 0].dropna()
+            if len(prices) >= 100:
+                return prices, sym
+            else:
+                errors.append(f"{sym}: only {len(prices)} rows")
+        except Exception as e:
+            errors.append(f"{sym}: {e}")
+
+    # Last resort: try with period= instead of date range (yfinance sometimes
+    # works with period even when start/end fails)
+    for sym in ticker_list:
+        try:
+            raw = yf.download(
+                sym,
+                period="max",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+            prices = extract_close(raw, sym)
+            prices = prices[prices > 0].dropna()
+            # Filter to requested range
+            prices = prices.loc[str(start):str(end)]
+            if len(prices) >= 100:
+                return prices, sym
+            else:
+                errors.append(f"{sym} (period=max): only {len(prices)} rows after filter")
+        except Exception as e:
+            errors.append(f"{sym} (period=max): {e}")
+
+    raise ValueError(
+        "Could not download data from any ticker symbol.\n"
+        "Attempted:\n" + "\n".join(f"  • {e}" for e in errors) + "\n\n"
+        "**Suggestions:**\n"
+        "- Try S&P 500 or Nasdaq 100 to verify connectivity\n"
+        "- NSE India data via Yahoo Finance can be intermittently unavailable\n"
+        "- Try a wider date range (e.g. 2015–2023)"
+    )
+
+
 def extract_close(df: pd.DataFrame, ticker_sym: str) -> pd.Series:
     """
     Robustly extract Close prices from yfinance output.
-    Modern yfinance always returns MultiIndex columns: (field, ticker).
-    Falls back gracefully for flat columns.
+    Handles both MultiIndex (modern yfinance) and flat columns (older).
     """
+    if df.empty:
+        return pd.Series(dtype=float)
+
     if isinstance(df.columns, pd.MultiIndex):
-        # Try (Close, ticker) — standard yfinance multi-level
-        if ("Close", ticker_sym) in df.columns:
-            return df[("Close", ticker_sym)].dropna()
-        # Try (Adj Close, ticker)
-        if ("Adj Close", ticker_sym) in df.columns:
-            return df[("Adj Close", ticker_sym)].dropna()
-        # Grab any Close column
+        # Standard modern yfinance: (field, ticker)
+        for field in ("Close", "Adj Close"):
+            if (field, ticker_sym) in df.columns:
+                return df[(field, ticker_sym)].dropna()
+        # Grab any Close-like column
         close_cols = [(f, t) for f, t in df.columns if f in ("Close", "Adj Close")]
         if close_cols:
             return df[close_cols[0]].dropna()
-        # Last resort: first numeric column
         return df.iloc[:, 0].dropna()
     else:
-        # Flat columns (older yfinance or single ticker)
         for col in ("Close", "Adj Close", "close"):
             if col in df.columns:
                 return df[col].dropna()
@@ -168,46 +226,22 @@ def rolling_sharpe(returns_series, window=60):
 
 def garch_forecast_variance(garch_res, horizon):
     """
-    FIX: arch 6+ changed forecast() API.
-    Use start=last index position to get a single-row forecast DataFrame,
-    then take the last row which contains h.1 … h.{horizon} columns.
+    arch 6+ compatible: use start=n-1 to get last-row forecast.
     """
     n = len(garch_res.resid.dropna())
-    # start at the last in-sample observation index
     forecasts = garch_res.forecast(horizon=horizon, start=n - 1, reindex=False)
-    # .variance is a DataFrame; last row has the h-step-ahead variances
-    f_var = forecasts.variance.iloc[-1]   # Series of length = horizon
-    return f_var  # already in % units (returns were in %)
+    f_var = forecasts.variance.iloc[-1]
+    return f_var
 
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN COMPUTATION (cached)
 # ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
-    # ── 1. Download & extract price ──────────────────────────
-    raw = yf.download(
-        ticker_sym,
-        start=str(start),
-        end=str(end),
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
-    if raw.empty:
-        raise ValueError(
-            f"No data returned for '{ticker_sym}'. "
-            "Check your internet connection or try a different date range."
-        )
-
-    prices = extract_close(raw, ticker_sym)
-    prices = prices[prices > 0].dropna()
-
-    if len(prices) < 100:
-        raise ValueError(
-            f"Only {len(prices)} valid price observations found for {ticker_sym}. "
-            "Need at least 100. Widen your date range."
-        )
+def load_and_compute(ticker_name, ticker_list, start, end, confidence, n_regimes):
+    # ── 1. Download with fallback chain ──────────────────────
+    prices, sym_used = download_with_fallback(ticker_list, str(start), str(end))
+    st.session_state["sym_used"] = sym_used
 
     # ── 2. Log returns (%) ───────────────────────────────────
     returns = np.log(prices / prices.shift(1))
@@ -220,7 +254,7 @@ def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
     garch_mdl = arch_model(returns, vol="Garch", p=1, q=1,
                            dist="normal", mean="Constant")
     garch_res = garch_mdl.fit(disp="off", show_warning=False)
-    cond_vol  = garch_res.conditional_volatility  # daily σ in % units
+    cond_vol  = garch_res.conditional_volatility
     annual_vol = cond_vol * np.sqrt(252)
 
     params = {
@@ -256,7 +290,6 @@ def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
     hmm.fit(X)
     states = hmm.predict(X)
 
-    # Sort states by mean return (ascending → Bear first, Bull last)
     state_order = np.argsort(hmm.means_[:, 0])
     if n_regimes == 2:
         labels_map = {state_order[0]: "Bear 🔴", state_order[1]: "Bull 🟢"}
@@ -276,11 +309,10 @@ def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
     regime_labels = pd.Series(states, index=aligned.index).map(labels_map)
 
     # ── 6. VaR / CVaR ────────────────────────────────────────
-    mu      = returns.mean()
-    z       = stats.norm.ppf(1 - confidence)
+    mu       = returns.mean()
+    z        = stats.norm.ppf(1 - confidence)
     var_pct  = mu + z * cond_vol
     cvar_pct = mu - cond_vol * stats.norm.pdf(z) / (1 - confidence)
-    # Normalised to ₹1 000 000 base (scaled in UI)
     var_inr  = abs(var_pct  / 100) * 1_000_000
     cvar_inr = abs(cvar_pct / 100) * 1_000_000
 
@@ -305,11 +337,12 @@ def load_and_compute(ticker_sym, start, end, confidence, n_regimes):
 # DASHBOARD
 # ─────────────────────────────────────────────────────────────────
 if run_button:
+    ticker_list = TICKERS[ticker_name]
     with st.spinner("⏳ Downloading data and running models — this takes ~15 seconds..."):
         try:
             (df, params, garch_res, hmm,
              labels_map, color_map, comparison, returns) = load_and_compute(
-                TICKERS[ticker_name], start_date, end_date, confidence, n_regimes
+                ticker_name, ticker_list, start_date, end_date, confidence, n_regimes
             )
         except Exception:
             import traceback
@@ -317,12 +350,13 @@ if run_button:
             st.code(traceback.format_exc())
             st.stop()
 
+    sym_used = st.session_state.get("sym_used", ticker_list[0])
     scale = portfolio_val / 1_000_000
     df["var_inr_scaled"]  = df["var_inr"]  * scale
     df["cvar_inr_scaled"] = df["cvar_inr"] * scale
 
     st.success(
-        f"✓ Analysis complete — {len(df)} trading days | {ticker_name} | "
+        f"✓ Analysis complete — {len(df)} trading days | {ticker_name} (symbol: `{sym_used}`) | "
         f"{df.index[0].date()} → {df.index[-1].date()}"
     )
 
@@ -621,14 +655,13 @@ if run_button:
         st.subheader(f"📡 GARCH Volatility Forecast — Next {forecast_days} Trading Days")
         st.markdown("GARCH forecasts mean-revert toward long-run volatility.")
 
-        # ── FIX: use garch_forecast_variance() helper ──
         try:
             f_var = garch_forecast_variance(garch_res, forecast_days)
         except Exception as e:
             st.error(f"Forecast failed: {e}")
             st.stop()
 
-        f_vol_daily  = np.sqrt(f_var.values)          # daily σ in %
+        f_vol_daily  = np.sqrt(f_var.values)
         f_vol_annual = f_vol_daily * np.sqrt(252)
 
         current_vol = df["annual_vol"].iloc[-1]
@@ -752,14 +785,14 @@ if run_button:
         export_cols = ["price","returns","annual_vol","regime","var_pct","cvar_pct",
                        "var_inr_scaled","cvar_inr_scaled","signal",
                        "strategy_return","cum_strategy","cum_bh"]
-        # Only include columns that exist (signal/strategy may not if backtest tab not visited)
         export_cols = [c for c in export_cols if c in df.columns]
         export_df = df[export_cols].copy()
-        export_df.columns = [
+        col_labels = [
             "Price","Log Return (%)","Annual Vol (%)","Regime",
             "VaR (%)","CVaR (%)","VaR (₹)","CVaR (₹)",
             "Signal","Strategy Return (%)","Cumulative Strategy","Cumulative B&H"
-        ][:len(export_cols)]
+        ]
+        export_df.columns = col_labels[:len(export_cols)]
 
         st.download_button(
             "⬇️ Download Full Dataset (CSV)",
@@ -801,7 +834,7 @@ else:
     | 📥 Download | Export | CSV | All results downloadable |
 
     ### Indexes covered:
-    - **Nifty 50** · **Nifty Bank** · **Nifty IT**
+    - **Nifty 50** · **Nifty Bank** · **Nifty IT** · **BSE Sensex** · **S&P 500** · **Nasdaq 100**
 
     ### Key techniques:
     `GARCH(1,1)` · `GJR-GARCH` · `EGARCH` · `HMM (Viterbi)` · `VaR` · `CVaR` · `Kupiec POF` · `Sharpe` · `Sortino` · `Calmar` · `Rolling Sharpe`
