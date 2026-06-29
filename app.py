@@ -1,22 +1,23 @@
 """
 Multi-Asset Volatility Regime Detection & Risk Dashboard
 =========================================================
-FIXED VERSION v2 — Resolves:
-  1. yfinance ^NSEI / ^NSEBANK / ^CNXIT ticker failures (symbol aliasing + retry chain)
-  2. MultiIndex column extraction (modern yfinance)
-  3. arch 6+ forecast() API
-  4. Pinned yfinance==0.2.40 via requirements.txt
+Uses local CSV files (Date, Close columns) — no internet download required.
+
+Supported tickers:
+  - Nifty 50     → nifty50.csv
+  - Nifty Bank   → banknifty.csv
+  - Nifty IT     → niftyit.csv
 
 Run with: streamlit run app.py
 """
 
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from plotly.subplots import make_subplots
-import yfinance as yf
 from arch import arch_model
 from hmmlearn.hmm import GaussianHMM
 from sklearn.preprocessing import StandardScaler
@@ -38,9 +39,9 @@ st.set_page_config(
 st.markdown("""
 <style>
     .stMetric { background: #0f172a; border-radius: 8px; padding: 10px; }
-    .regime-bull { color: #22c55e; font-weight: bold; }
-    .regime-bear { color: #ef4444; font-weight: bold; }
-    .regime-side { color: #f59e0b; font-weight: bold; }
+    .regime-bull  { color: #22c55e; font-weight: bold; }
+    .regime-bear  { color: #ef4444; font-weight: bold; }
+    .regime-side  { color: #f59e0b; font-weight: bold; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -49,21 +50,22 @@ st.markdown("*GARCH Volatility · HMM Regime Detection · Dynamic VaR/CVaR · Ba
 st.divider()
 
 # ─────────────────────────────────────────────────────────────────
+# CSV FILE MAPPING  ← only change needed to add more indices
+# Place CSV files in the same folder as app.py
+# Each CSV must have columns: Date, Close
+# ─────────────────────────────────────────────────────────────────
+CSV_FILES = {
+    "Nifty 50":   "nifty50.csv",
+    "Nifty Bank": "banknifty.csv",
+    "Nifty IT":   "niftyit.csv",
+}
+
+# ─────────────────────────────────────────────────────────────────
 # SIDEBAR
 # ─────────────────────────────────────────────────────────────────
 st.sidebar.header("⚙️ Configuration")
 
-# Each entry: display name → list of ticker symbols to try in order
-TICKERS = {
-    "Nifty 50":   ["^NSEI", "NIFTYBEES.NS", "0P0000YWQO.BO"],
-    "Nifty Bank": ["^NSEBANK", "BANKBEES.NS", "BNKBEES.NS"],
-    "Nifty IT":   ["^CNXIT", "ITBEES.NS"],
-    "BSE Sensex": ["^BSESN"],
-    "S&P 500":    ["^GSPC"],
-    "Nasdaq 100": ["^NDX"],
-}
-
-ticker_name   = st.sidebar.selectbox("Primary Index", list(TICKERS.keys()))
+ticker_name   = st.sidebar.selectbox("Primary Index", list(CSV_FILES.keys()))
 start_date    = st.sidebar.date_input("Start Date", pd.to_datetime("2018-01-01"))
 end_date      = st.sidebar.date_input("End Date",   pd.to_datetime("2024-12-31"))
 confidence    = st.sidebar.slider("VaR Confidence Level", 0.90, 0.99, 0.95, step=0.01)
@@ -84,86 +86,46 @@ run_button = st.sidebar.button("🚀 Run Analysis", type="primary", use_containe
 # HELPER FUNCTIONS
 # ─────────────────────────────────────────────────────────────────
 
-def download_with_fallback(ticker_list: list, start: str, end: str) -> tuple[pd.Series, str]:
+def load_csv_prices(csv_filename: str, start, end) -> pd.Series:
     """
-    Try each ticker symbol in ticker_list until one returns data.
-    Returns (price_series, symbol_used).
+    Load price data from a local CSV file with Date and Close columns.
+    Filters to the requested date range.
     """
-    errors = []
-    for sym in ticker_list:
-        try:
-            raw = yf.download(
-                sym,
-                start=start,
-                end=end,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
-            prices = extract_close(raw, sym)
-            prices = prices[prices > 0].dropna()
-            if len(prices) >= 100:
-                return prices, sym
-            else:
-                errors.append(f"{sym}: only {len(prices)} rows")
-        except Exception as e:
-            errors.append(f"{sym}: {e}")
+    # Support paths relative to app.py location
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    filepath = os.path.join(base_dir, csv_filename)
 
-    # Last resort: try with period= instead of date range (yfinance sometimes
-    # works with period even when start/end fails)
-    for sym in ticker_list:
-        try:
-            raw = yf.download(
-                sym,
-                period="max",
-                auto_adjust=True,
-                progress=False,
-                threads=False,
-            )
-            prices = extract_close(raw, sym)
-            prices = prices[prices > 0].dropna()
-            # Filter to requested range
-            prices = prices.loc[str(start):str(end)]
-            if len(prices) >= 100:
-                return prices, sym
-            else:
-                errors.append(f"{sym} (period=max): only {len(prices)} rows after filter")
-        except Exception as e:
-            errors.append(f"{sym} (period=max): {e}")
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(
+            f"CSV file not found: {filepath}\n"
+            f"Please place '{csv_filename}' in the same folder as app.py."
+        )
 
-    raise ValueError(
-        "Could not download data from any ticker symbol.\n"
-        "Attempted:\n" + "\n".join(f"  • {e}" for e in errors) + "\n\n"
-        "**Suggestions:**\n"
-        "- Try S&P 500 or Nasdaq 100 to verify connectivity\n"
-        "- NSE India data via Yahoo Finance can be intermittently unavailable\n"
-        "- Try a wider date range (e.g. 2015–2023)"
-    )
+    df = pd.read_csv(filepath, parse_dates=["Date"], index_col="Date")
+    df.index = pd.to_datetime(df.index)
+    df = df.sort_index()
 
+    # Extract Close column (case-insensitive)
+    close_col = next((c for c in df.columns if c.strip().lower() == "close"), None)
+    if close_col is None:
+        raise ValueError(
+            f"Could not find a 'Close' column in {csv_filename}.\n"
+            f"Available columns: {list(df.columns)}"
+        )
 
-def extract_close(df: pd.DataFrame, ticker_sym: str) -> pd.Series:
-    """
-    Robustly extract Close prices from yfinance output.
-    Handles both MultiIndex (modern yfinance) and flat columns (older).
-    """
-    if df.empty:
-        return pd.Series(dtype=float)
+    prices = df[close_col].dropna()
+    prices = prices[prices > 0]
 
-    if isinstance(df.columns, pd.MultiIndex):
-        # Standard modern yfinance: (field, ticker)
-        for field in ("Close", "Adj Close"):
-            if (field, ticker_sym) in df.columns:
-                return df[(field, ticker_sym)].dropna()
-        # Grab any Close-like column
-        close_cols = [(f, t) for f, t in df.columns if f in ("Close", "Adj Close")]
-        if close_cols:
-            return df[close_cols[0]].dropna()
-        return df.iloc[:, 0].dropna()
-    else:
-        for col in ("Close", "Adj Close", "close"):
-            if col in df.columns:
-                return df[col].dropna()
-        return df.iloc[:, 0].dropna()
+    # Filter date range
+    prices = prices.loc[str(start):str(end)]
+
+    if len(prices) < 100:
+        raise ValueError(
+            f"Only {len(prices)} rows found for {csv_filename} in range {start} → {end}.\n"
+            "Try widening the date range in the sidebar."
+        )
+
+    return prices
 
 
 def performance_metrics(returns_series):
@@ -225,23 +187,19 @@ def rolling_sharpe(returns_series, window=60):
 
 
 def garch_forecast_variance(garch_res, horizon):
-    """
-    arch 6+ compatible: use start=n-1 to get last-row forecast.
-    """
+    """arch 6+ compatible forecast."""
     n = len(garch_res.resid.dropna())
     forecasts = garch_res.forecast(horizon=horizon, start=n - 1, reindex=False)
-    f_var = forecasts.variance.iloc[-1]
-    return f_var
+    return forecasts.variance.iloc[-1]
 
 
 # ─────────────────────────────────────────────────────────────────
 # MAIN COMPUTATION (cached)
 # ─────────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def load_and_compute(ticker_name, ticker_list, start, end, confidence, n_regimes):
-    # ── 1. Download with fallback chain ──────────────────────
-    prices, sym_used = download_with_fallback(ticker_list, str(start), str(end))
-    st.session_state["sym_used"] = sym_used
+def load_and_compute(ticker_name, csv_filename, start, end, confidence, n_regimes):
+    # ── 1. Load from CSV ─────────────────────────────────────
+    prices = load_csv_prices(csv_filename, start, end)
 
     # ── 2. Log returns (%) ───────────────────────────────────
     returns = np.log(prices / prices.shift(1))
@@ -337,12 +295,13 @@ def load_and_compute(ticker_name, ticker_list, start, end, confidence, n_regimes
 # DASHBOARD
 # ─────────────────────────────────────────────────────────────────
 if run_button:
-    ticker_list = TICKERS[ticker_name]
-    with st.spinner("⏳ Downloading data and running models — this takes ~15 seconds..."):
+    csv_filename = CSV_FILES[ticker_name]
+
+    with st.spinner("⏳ Loading CSV and running models — this takes ~15 seconds..."):
         try:
             (df, params, garch_res, hmm,
              labels_map, color_map, comparison, returns) = load_and_compute(
-                ticker_name, ticker_list, start_date, end_date, confidence, n_regimes
+                ticker_name, csv_filename, start_date, end_date, confidence, n_regimes
             )
         except Exception:
             import traceback
@@ -350,13 +309,13 @@ if run_button:
             st.code(traceback.format_exc())
             st.stop()
 
-    sym_used = st.session_state.get("sym_used", ticker_list[0])
     scale = portfolio_val / 1_000_000
     df["var_inr_scaled"]  = df["var_inr"]  * scale
     df["cvar_inr_scaled"] = df["cvar_inr"] * scale
 
     st.success(
-        f"✓ Analysis complete — {len(df)} trading days | {ticker_name} (symbol: `{sym_used}`) | "
+        f"✓ Analysis complete — {len(df)} trading days | {ticker_name} "
+        f"(source: `{csv_filename}`) | "
         f"{df.index[0].date()} → {df.index[-1].date()}"
     )
 
@@ -834,7 +793,10 @@ else:
     | 📥 Download | Export | CSV | All results downloadable |
 
     ### Indexes covered:
-    - **Nifty 50** · **Nifty Bank** · **Nifty IT** · **BSE Sensex** · **S&P 500** · **Nasdaq 100**
+    - **Nifty 50** · **Nifty Bank** · **Nifty IT**
+
+    ### Data source:
+    Local CSV files (`nifty50.csv`, `banknifty.csv`, `niftyit.csv`) — place them in the same folder as `app.py`.
 
     ### Key techniques:
     `GARCH(1,1)` · `GJR-GARCH` · `EGARCH` · `HMM (Viterbi)` · `VaR` · `CVaR` · `Kupiec POF` · `Sharpe` · `Sortino` · `Calmar` · `Rolling Sharpe`
